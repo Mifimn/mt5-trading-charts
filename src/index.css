@@ -1,0 +1,68 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  @apply bg-dark-900 text-slate-200 font-sans;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-dark-800;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-dark-600 rounded hover:bg-dark-500;
+}
+
+/* Chart container styles */
+.chart-container {
+  @apply relative w-full h-full bg-chart-background;
+}
+
+.chart-canvas {
+  @apply block w-full h-full;
+}
+
+/* Dropdown styles */
+.dropdown-menu {
+  @apply absolute top-full mt-2 bg-dark-800 border border-dark-700 rounded shadow-lg z-50 min-w-max;
+}
+
+.dropdown-item {
+  @apply px-4 py-2 hover:bg-dark-700 cursor-pointer transition-colors text-sm;
+}
+
+.dropdown-item.active {
+  @apply bg-blue-600 text-white;
+}
+
+/* Button styles */
+.btn-primary {
+  @apply px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors;
+}
+
+.btn-secondary {
+  @apply px-4 py-2 bg-dark-700 hover:bg-dark-600 text-slate-200 rounded transition-colors;
+}
+
+/* Loading animation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
