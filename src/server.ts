@@ -1,8 +1,8 @@
 import express, { Express, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
+import WebSocket from 'ws';
 import http from 'http';
 import axios from 'axios';
-import WebSocket from 'ws';
 import { Candle, Timeframe, ChartMessage } from './types/index.js';
 
 const app: Express = express();
@@ -46,18 +46,16 @@ const SUPPORTED_PAIRS = [
 
 // Deriv API WebSocket connection
 let derivWs: WebSocket | null = null;
-const derivSubscriptions = new Map<string, { req_id: number; pair: string; timeframe: Timeframe }>();
+const derivPendingRequests = new Map<number, { resolve: (candles: Candle[]) => void; timeout: NodeJS.Timeout }>();
 let nextReqId = 1;
-let derivConnected = false;
 
 // Initialize Deriv WebSocket connection
 function initDerivConnection() {
   try {
-    console.log('🔗 Attempting to connect to Deriv API...');
+    console.log('🔌 Attempting to connect to Deriv API...');
     derivWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
 
-    derivWs.onopen = () => {
-      derivConnected = true;
+    derivWs.on('open', () => {
       console.log('✅ Connected to Deriv API');
       // Authorize with app_id
       derivWs?.send(
@@ -65,94 +63,81 @@ function initDerivConnection() {
           authorize: 'AQIC3xDTMSJySEQoK1KSwPFZSXvfJK_Mdu6yzGFnWQk2AoI',
         })
       );
-    };
+    });
 
-    derivWs.onmessage = (event) => {
+    derivWs.on('message', (data: Buffer) => {
       try {
-        const data = JSON.parse(event.data);
+        const message = JSON.parse(data.toString());
 
-        if (data.authorize) {
+        if (message.authorize) {
           console.log('✅ Deriv API authorized');
         }
 
-        if (data.candles) {
-          handleDerivCandles(data);
+        if (message.candles && message.req_id) {
+          const request = derivPendingRequests.get(message.req_id);
+          if (request) {
+            clearTimeout(request.timeout);
+            derivPendingRequests.delete(message.req_id);
+
+            const candles: Candle[] = message.candles.map((c: any) => ({
+              timestamp: c.epoch * 1000,
+              open: parseFloat(c.open),
+              high: parseFloat(c.high),
+              low: parseFloat(c.low),
+              close: parseFloat(c.close),
+              volume: c.tick_count || 0,
+            }));
+
+            request.resolve(candles);
+          }
         }
 
-        if (data.tick) {
-          handleDerivTick(data);
+        if (message.tick) {
+          handleDerivTick(message.tick);
         }
       } catch (error) {
         console.error('Error processing Deriv message:', error);
       }
-    };
+    });
 
-    derivWs.onerror = (error) => {
-      derivConnected = false;
-      console.error('❌ Deriv WebSocket error:', error);
-    };
+    derivWs.on('error', (error: any) => {
+      console.error('❌ Deriv WebSocket error:', error.message);
+    });
 
-    derivWs.onclose = () => {
-      derivConnected = false;
+    derivWs.on('close', () => {
       console.log('❌ Deriv WebSocket disconnected');
+      derivWs = null;
+      // Clear pending requests
+      derivPendingRequests.forEach((req) => {
+        clearTimeout(req.timeout);
+        req.resolve([]);
+      });
+      derivPendingRequests.clear();
       // Attempt to reconnect after 5 seconds
       setTimeout(initDerivConnection, 5000);
-    };
+    });
   } catch (error) {
-    derivConnected = false;
     console.error('❌ Error initializing Deriv connection:', error);
     setTimeout(initDerivConnection, 5000);
   }
 }
 
-function handleDerivCandles(data: any) {
-  if (data.candles && Array.isArray(data.candles)) {
-    const candles: Candle[] = data.candles.map((c: any) => ({
-      timestamp: c.epoch * 1000,
-      open: parseFloat(c.open),
-      high: parseFloat(c.high),
-      low: parseFloat(c.low),
-      close: parseFloat(c.close),
-      volume: c.tick_count || 0,
-    }));
+function handleDerivTick(tick: any) {
+  const pair = tick.symbol;
 
-    // Find which subscription this is for
-    const subscription = Array.from(derivSubscriptions.values()).find((s) => s.req_id === data.req_id);
-
-    if (subscription) {
-      const cacheKey = `${subscription.pair}:${subscription.timeframe}`;
-      candleCache.set(cacheKey, { candles, timestamp: Date.now() });
-
-      // Broadcast to all connected clients
-      broadcastToClients({
-        type: 'candles_update',
-        pair: subscription.pair,
-        timeframe: subscription.timeframe,
-        candles,
-      });
-    }
+  if (!ticksBuffer.has(pair)) {
+    ticksBuffer.set(pair, []);
   }
-}
 
-function handleDerivTick(data: any) {
-  if (data.tick) {
-    const tick = data.tick;
-    const pair = tick.symbol;
+  ticksBuffer.get(pair)!.push({
+    timestamp: tick.epoch * 1000,
+    price: parseFloat(tick.quote),
+  });
 
-    if (!ticksBuffer.has(pair)) {
-      ticksBuffer.set(pair, []);
-    }
-
-    ticksBuffer.get(pair)!.push({
-      timestamp: tick.epoch * 1000,
-      price: parseFloat(tick.quote),
-    });
-
-    // Keep only recent ticks
-    const buffer = ticksBuffer.get(pair)!;
-    if (buffer.length > 1000) {
-      buffer.shift();
-    }
+  // Keep only recent ticks
+  const buffer = ticksBuffer.get(pair)!;
+  if (buffer.length > 1000) {
+    buffer.shift();
   }
 }
 
@@ -186,8 +171,8 @@ app.get('/api/candles', async (req: Request, res: Response) => {
       return res.json({ pair, timeframe, candles, source: 'cache' });
     }
 
-    // Try to fetch from Deriv API if connected
-    if (derivConnected) {
+    // Try to fetch from Deriv API first
+    if (derivWs && derivWs.readyState === 1) {
       const candles = await fetchFromDerivAPI(pair as string, timeframe as Timeframe, parseInt(limit as string));
       if (candles.length > 0) {
         candleCache.set(cacheKey, { candles, timestamp: Date.now() });
@@ -195,9 +180,10 @@ app.get('/api/candles', async (req: Request, res: Response) => {
       }
     }
 
-    // Fallback to mock data
-    console.warn(`Using mock data for ${pair} ${timeframe}`);
+    // Fallback to mock data if API fails or not connected
+    console.log(`📊 Using mock data for ${pair} ${timeframe}`);
     const mockCandles = generateMockCandles(pair as string, timeframe as Timeframe, parseInt(limit as string));
+    candleCache.set(cacheKey, { candles: mockCandles, timestamp: Date.now() });
     return res.json({ pair, timeframe, candles: mockCandles, source: 'mock' });
   } catch (error) {
     console.error('Error fetching candles:', error);
@@ -216,8 +202,6 @@ async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: numb
 
     const req_id = nextReqId++;
     const granularity = timeframeToSeconds[timeframe];
-
-    // Map symbol if needed
     const derivSymbol = mapToDeriVSymbol(pair);
 
     const request = {
@@ -233,41 +217,24 @@ async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: numb
 
     // Timeout after 10 seconds
     const timeout = setTimeout(() => {
-      console.warn(`⏱️ Deriv API request ${req_id} timed out`);
+      console.warn(`⏱️ Deriv API request ${req_id} timed out for ${pair}`);
+      derivPendingRequests.delete(req_id);
       resolve([]);
     }, 10000);
 
-    // Store subscription temporarily to handle response
-    derivSubscriptions.set(`temp_${req_id}`, { req_id, pair, timeframe });
+    derivPendingRequests.set(req_id, {
+      resolve,
+      timeout,
+    });
 
-    // Create a one-time message handler
-    const handleResponse = (event: any) => {
-      try {
-        const data = JSON.parse(event.data);
-
-        if (data.req_id === req_id && data.candles) {
-          clearTimeout(timeout);
-          derivSubscriptions.delete(`temp_${req_id}`);
-          derivWs?.removeEventListener('message', handleResponse);
-
-          const candles: Candle[] = data.candles.map((c: any) => ({
-            timestamp: c.epoch * 1000,
-            open: parseFloat(c.open),
-            high: parseFloat(c.high),
-            low: parseFloat(c.low),
-            close: parseFloat(c.close),
-            volume: c.tick_count || 0,
-          }));
-
-          resolve(candles);
-        }
-      } catch (error) {
-        console.error('Error parsing Deriv response:', error);
-      }
-    };
-
-    derivWs?.addEventListener('message', handleResponse);
-    derivWs?.send(JSON.stringify(request));
+    try {
+      derivWs?.send(JSON.stringify(request));
+    } catch (error) {
+      console.error('Error sending request to Deriv:', error);
+      clearTimeout(timeout);
+      derivPendingRequests.delete(req_id);
+      resolve([]);
+    }
   });
 }
 
@@ -294,15 +261,6 @@ app.get('/api/pairs', (req: Request, res: Response) => {
   res.json(SUPPORTED_PAIRS);
 });
 
-// API endpoint for connection status
-app.get('/api/status', (req: Request, res: Response) => {
-  res.json({
-    derivConnected,
-    cacheSize: candleCache.size,
-    subscribedClients: wss.clients.size,
-  });
-});
-
 // WebSocket server setup
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
@@ -311,9 +269,9 @@ wss.on('connection', (ws) => {
   console.log('📱 WebSocket client connected');
   const clientId = Math.random().toString(36).substr(2, 9);
 
-  ws.on('message', (data: string) => {
+  ws.on('message', (data: Buffer) => {
     try {
-      const message: ChartMessage = JSON.parse(data);
+      const message: ChartMessage = JSON.parse(data.toString());
       handleWebSocketMessage(clientId, message, ws);
     } catch (error) {
       console.error('Error parsing WebSocket message:', error);
@@ -391,7 +349,7 @@ setInterval(() => {
   });
 }, 1000); // Update every second
 
-// Fallback mock data generation (for when API fails)
+// Fallback mock data generation
 function generateMockCandles(pair: string, timeframe: Timeframe, limit: number): Candle[] {
   const candles: Candle[] = [];
   const now = Math.floor(Date.now() / 1000);
@@ -438,11 +396,13 @@ function getBasePriceForPair(pair: string): number {
 }
 
 // Initialize Deriv connection on startup
-console.log('🌍 Starting MT5 Trading Charts Server...');
-initDerivConnection();
+setTimeout(() => {
+  console.log('\n🌍 Initializing real market data connection...\n');
+  initDerivConnection();
+}, 1000);
 
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
   console.log(`📊 WebSocket server ready at ws://localhost:${PORT}/ws`);
-  console.log(`📈 API Status: http://localhost:${PORT}/api/status`);
+  console.log(`💡 Charts will use real Deriv data when connected, or mock data as fallback\n`);
 });
