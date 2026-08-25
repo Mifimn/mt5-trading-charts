@@ -10,6 +10,7 @@ export default defineConfig({
     },
   },
   server: {
+    allowedHosts: true, // This fixes the Replit URL block!
     proxy: {
       '/api': {
         target: 'http://localhost:3001',
