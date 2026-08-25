@@ -13,6 +13,9 @@ app.use(express.static('dist'));
 // Store active subscriptions
 const subscriptions = new Map<string, Set<string>>();
 
+// Store cached candles to avoid excessive API calls
+const candleCache = new Map<string, { candles: Candle[]; timestamp: number }>();
+
 // Timeframe to seconds mapping
 const timeframeToSeconds: Record<Timeframe, number> = {
   M1: 60,
@@ -22,6 +25,9 @@ const timeframeToSeconds: Record<Timeframe, number> = {
   H1: 3600,
   H4: 14400,
 };
+
+// Deriv API ticks buffer for building candles
+const ticksBuffer = new Map<string, any[]>();
 
 // Supported pairs (Deriv Volatility Indices)
 const SUPPORTED_PAIRS = [
@@ -37,6 +43,120 @@ const SUPPORTED_PAIRS = [
   { symbol: 'XAUUSD', displayName: 'Gold/USD' },
 ];
 
+// Deriv API WebSocket connection
+let derivWs: WebSocket | null = null;
+const derivSubscriptions = new Map<string, { req_id: number; pair: string; timeframe: Timeframe }>();
+let nextReqId = 1;
+
+// Initialize Deriv WebSocket connection
+function initDerivConnection() {
+  try {
+    derivWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
+
+    derivWs.onopen = () => {
+      console.log('✅ Connected to Deriv API');
+      // Authorize with app_id (or token if you have one)
+      derivWs?.send(
+        JSON.stringify({
+          authorize: 'AQIC3xDTMSJySEQoK1KSwPFZSXvfJK_Mdu6yzGFnWQk2AoI',
+        })
+      );
+    };
+
+    derivWs.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data.authorize) {
+          console.log('✅ Deriv API authorized');
+        }
+
+        if (data.candles) {
+          handleDerivCandles(data);
+        }
+
+        if (data.tick) {
+          handleDerivTick(data);
+        }
+      } catch (error) {
+        console.error('Error processing Deriv message:', error);
+      }
+    };
+
+    derivWs.onerror = (error) => {
+      console.error('Deriv WebSocket error:', error);
+    };
+
+    derivWs.onclose = () => {
+      console.log('❌ Deriv WebSocket disconnected');
+      // Attempt to reconnect after 5 seconds
+      setTimeout(initDerivConnection, 5000);
+    };
+  } catch (error) {
+    console.error('Error initializing Deriv connection:', error);
+    setTimeout(initDerivConnection, 5000);
+  }
+}
+
+function handleDerivCandles(data: any) {
+  if (data.candles && Array.isArray(data.candles)) {
+    const candles: Candle[] = data.candles.map((c: any) => ({
+      timestamp: c.epoch * 1000,
+      open: parseFloat(c.open),
+      high: parseFloat(c.high),
+      low: parseFloat(c.low),
+      close: parseFloat(c.close),
+      volume: c.tick_count || 0,
+    }));
+
+    // Find which subscription this is for
+    const subscription = Array.from(derivSubscriptions.values()).find((s) => s.req_id === data.req_id);
+
+    if (subscription) {
+      const cacheKey = `${subscription.pair}:${subscription.timeframe}`;
+      candleCache.set(cacheKey, { candles, timestamp: Date.now() });
+
+      // Broadcast to all connected clients
+      broadcastToClients({
+        type: 'candles_update',
+        pair: subscription.pair,
+        timeframe: subscription.timeframe,
+        candles,
+      });
+    }
+  }
+}
+
+function handleDerivTick(data: any) {
+  if (data.tick) {
+    const tick = data.tick;
+    const pair = tick.symbol;
+
+    if (!ticksBuffer.has(pair)) {
+      ticksBuffer.set(pair, []);
+    }
+
+    ticksBuffer.get(pair)!.push({
+      timestamp: tick.epoch * 1000,
+      price: parseFloat(tick.quote),
+    });
+
+    // Keep only recent ticks
+    const buffer = ticksBuffer.get(pair)!;
+    if (buffer.length > 1000) {
+      buffer.shift();
+    }
+  }
+}
+
+function broadcastToClients(message: any) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === 1) {
+      client.send(JSON.stringify(message));
+    }
+  });
+}
+
 // API endpoint to fetch historical candle data
 app.get('/api/candles', async (req: Request, res: Response) => {
   try {
@@ -50,20 +170,115 @@ app.get('/api/candles', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Invalid timeframe' });
     }
 
-    // Fetch data from a reliable public API (using Finnhub or similar)
-    // For Deriv indices, we'll use a mock generator that simulates realistic data
-    const candles = generateMockCandles(
-      pair as string,
-      timeframe as Timeframe,
-      parseInt(limit as string)
-    );
+    const cacheKey = `${pair}:${timeframe}`;
+    const cached = candleCache.get(cacheKey);
 
-    res.json({ pair, timeframe, candles });
+    // Use cache if available and fresh (within 5 minutes)
+    if (cached && Date.now() - cached.timestamp < 300000) {
+      const candles = cached.candles.slice(-parseInt(limit as string));
+      return res.json({ pair, timeframe, candles, source: 'cache' });
+    }
+
+    // Fetch from Deriv API
+    const candles = await fetchFromDerivAPI(pair as string, timeframe as Timeframe, parseInt(limit as string));
+
+    if (candles.length > 0) {
+      candleCache.set(cacheKey, { candles, timestamp: Date.now() });
+      return res.json({ pair, timeframe, candles, source: 'deriv' });
+    } else {
+      // Fallback to mock data if API fails
+      console.warn(`No real data for ${pair}, using mock data`);
+      const mockCandles = generateMockCandles(pair as string, timeframe as Timeframe, parseInt(limit as string));
+      return res.json({ pair, timeframe, candles: mockCandles, source: 'mock' });
+    }
   } catch (error) {
     console.error('Error fetching candles:', error);
     res.status(500).json({ error: 'Failed to fetch candle data' });
   }
 });
+
+// Fetch candles from Deriv API
+async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
+  return new Promise((resolve) => {
+    if (!derivWs || derivWs.readyState !== 1) {
+      console.warn('Deriv WebSocket not connected, using mock data');
+      resolve([]);
+      return;
+    }
+
+    const req_id = nextReqId++;
+    const granularity = timeframeToSeconds[timeframe];
+
+    // Map symbol if needed
+    const derivSymbol = mapToDeriVSymbol(pair);
+
+    const request = {
+      ticks_history: derivSymbol,
+      adjust_start_time: 1,
+      count: limit,
+      end: 'latest',
+      start: 1,
+      style: 'candles',
+      granularity: granularity,
+      req_id: req_id,
+    };
+
+    // Timeout after 10 seconds
+    const timeout = setTimeout(() => {
+      console.warn(`Deriv API request ${req_id} timed out`);
+      resolve([]);
+    }, 10000);
+
+    // Store subscription temporarily to handle response
+    derivSubscriptions.set(`temp_${req_id}`, { req_id, pair, timeframe });
+
+    // Listen for response
+    const originalOnMessage = derivWs!.onmessage;
+    derivWs!.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+
+        if (data.req_id === req_id && data.candles) {
+          clearTimeout(timeout);
+          derivSubscriptions.delete(`temp_${req_id}`);
+
+          const candles: Candle[] = data.candles.map((c: any) => ({
+            timestamp: c.epoch * 1000,
+            open: parseFloat(c.open),
+            high: parseFloat(c.high),
+            low: parseFloat(c.low),
+            close: parseFloat(c.close),
+            volume: c.tick_count || 0,
+          }));
+
+          resolve(candles);
+        }
+      } catch (error) {
+        console.error('Error parsing Deriv response:', error);
+      }
+    };
+
+    derivWs!.send(JSON.stringify(request));
+  });
+}
+
+// Map trading symbols to Deriv symbols
+function mapToDeriVSymbol(symbol: string): string {
+  const symbolMap: Record<string, string> = {
+    R_10: 'R_10',
+    R_25: 'R_25',
+    R_50: 'R_50',
+    R_75: 'R_75',
+    R_100: 'R_100',
+    EURUSD: 'frxEURUSD',
+    GBPUSD: 'frxGBPUSD',
+    USDJPY: 'frxUSDJPY',
+    AUDUSD: 'frxAUDUSD',
+    XAUUSD: 'XAUUSD',
+  };
+
+  return symbolMap[symbol] || symbol;
+}
 
 // API endpoint to get supported pairs
 app.get('/api/pairs', (req: Request, res: Response) => {
@@ -75,7 +290,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 wss.on('connection', (ws) => {
-  console.log('WebSocket client connected');
+  console.log('📱 WebSocket client connected');
   const clientId = Math.random().toString(36).substr(2, 9);
 
   ws.on('message', (data: string) => {
@@ -89,8 +304,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('WebSocket client disconnected');
-    // Clean up subscriptions
+    console.log('🔌 WebSocket client disconnected');
     subscriptions.forEach((subs) => subs.delete(clientId));
   });
 
@@ -108,7 +322,14 @@ function handleWebSocketMessage(clientId: string, message: ChartMessage, ws: any
           subscriptions.set(key, new Set());
         }
         subscriptions.get(key)!.add(clientId);
-        console.log(`Client ${clientId} subscribed to ${key}`);
+        console.log(`👤 Client ${clientId} subscribed to ${key}`);
+
+        // Send initial data from cache if available
+        const cached = candleCache.get(key);
+        if (cached) {
+          ws.send(JSON.stringify({ type: 'initial_candles', pair: message.pair, timeframe: message.timeframe, candles: cached.candles }));
+        }
+
         ws.send(JSON.stringify({ type: 'subscribed', pair: message.pair, timeframe: message.timeframe }));
       }
       break;
@@ -117,42 +338,46 @@ function handleWebSocketMessage(clientId: string, message: ChartMessage, ws: any
       if (message.pair && message.timeframe) {
         const key = `${message.pair}:${message.timeframe}`;
         subscriptions.get(key)?.delete(clientId);
-        console.log(`Client ${clientId} unsubscribed from ${key}`);
+        console.log(`👤 Client ${clientId} unsubscribed from ${key}`);
       }
       break;
   }
 }
 
-// Simulate live candle updates
+// Simulate live candle updates from cached data
 setInterval(() => {
   subscriptions.forEach((clientIds, key) => {
-    const [pair, timeframe] = key.split(':');
-    const newCandle = generateMockCandle(pair, timeframe as Timeframe);
+    const cached = candleCache.get(key);
+    if (cached && cached.candles.length > 0) {
+      const lastCandle = cached.candles[cached.candles.length - 1];
 
-    const message: ChartMessage = {
-      type: 'candle',
-      pair,
-      timeframe: timeframe as Timeframe,
-      data: newCandle,
-    };
+      // Simulate slight price changes
+      const variation = (Math.random() - 0.5) * (lastCandle.close * 0.001);
+      const updatedCandle = {
+        ...lastCandle,
+        close: parseFloat((lastCandle.close + variation).toFixed(5)),
+        high: parseFloat(Math.max(lastCandle.high, lastCandle.close + variation).toFixed(5)),
+        low: parseFloat(Math.min(lastCandle.low, lastCandle.close + variation).toFixed(5)),
+      };
 
-    clientIds.forEach((clientId) => {
-      wss.clients.forEach((client) => {
-        if (client.readyState === 1) {
-          client.send(JSON.stringify(message));
-        }
-      });
-    });
+      const [pair, timeframe] = key.split(':');
+      const message: ChartMessage = {
+        type: 'candle',
+        pair,
+        timeframe: timeframe as Timeframe,
+        data: updatedCandle,
+      };
+
+      broadcastToClients(message);
+    }
   });
 }, 1000); // Update every second
 
-// Mock data generation functions
+// Fallback mock data generation (for when API fails)
 function generateMockCandles(pair: string, timeframe: Timeframe, limit: number): Candle[] {
   const candles: Candle[] = [];
   const now = Math.floor(Date.now() / 1000);
   const interval = timeframeToSeconds[timeframe];
-  
-  // Realistic base prices for different pairs
   const basePrice = getBasePriceForPair(pair);
 
   for (let i = limit; i > 0; i--) {
@@ -176,25 +401,6 @@ function generateMockCandles(pair: string, timeframe: Timeframe, limit: number):
   return candles;
 }
 
-function generateMockCandle(pair: string, timeframe: Timeframe): Candle {
-  const timestamp = Date.now();
-  const basePrice = getBasePriceForPair(pair);
-  const open = basePrice + (Math.random() - 0.5) * 10;
-  const close = open + (Math.random() - 0.5) * 15;
-  const high = Math.max(open, close) + Math.random() * 5;
-  const low = Math.min(open, close) - Math.random() * 5;
-  const volume = Math.random() * 100000 + 50000;
-
-  return {
-    timestamp,
-    open: parseFloat(open.toFixed(5)),
-    high: parseFloat(high.toFixed(5)),
-    low: parseFloat(low.toFixed(5)),
-    close: parseFloat(close.toFixed(5)),
-    volume: parseFloat(volume.toFixed(2)),
-  };
-}
-
 // Get realistic base price for each pair
 function getBasePriceForPair(pair: string): number {
   const pairPrices: Record<string, number> = {
@@ -213,7 +419,11 @@ function getBasePriceForPair(pair: string): number {
   return pairPrices[pair] || 100 + Math.random() * 100;
 }
 
+// Initialize Deriv connection on startup
+initDerivConnection();
+
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
   console.log(`📊 WebSocket server ready at ws://localhost:${PORT}/ws`);
+  console.log(`🔗 Deriv API connection initializing...`);
 });
