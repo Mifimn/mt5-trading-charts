@@ -28,11 +28,13 @@ const SUPPORTED_PAIRS = [
   { symbol: 'R_10', displayName: 'Volatility 10 Index' },
   { symbol: 'R_25', displayName: 'Volatility 25 Index' },
   { symbol: 'R_50', displayName: 'Volatility 50 Index' },
+  { symbol: 'R_75', displayName: 'Volatility 75 Index' },
   { symbol: 'R_100', displayName: 'Volatility 100 Index' },
   { symbol: 'EURUSD', displayName: 'EUR/USD' },
   { symbol: 'GBPUSD', displayName: 'GBP/USD' },
   { symbol: 'USDJPY', displayName: 'USD/JPY' },
   { symbol: 'AUDUSD', displayName: 'AUD/USD' },
+  { symbol: 'XAUUSD', displayName: 'Gold/USD' },
 ];
 
 // API endpoint to fetch historical candle data
@@ -149,7 +151,9 @@ function generateMockCandles(pair: string, timeframe: Timeframe, limit: number):
   const candles: Candle[] = [];
   const now = Math.floor(Date.now() / 1000);
   const interval = timeframeToSeconds[timeframe];
-  const basePrice = Math.random() * 1000 + 100;
+  
+  // Realistic base prices for different pairs
+  const basePrice = getBasePriceForPair(pair);
 
   for (let i = limit; i > 0; i--) {
     const timestamp = (now - i * interval) * 1000;
@@ -174,7 +178,7 @@ function generateMockCandles(pair: string, timeframe: Timeframe, limit: number):
 
 function generateMockCandle(pair: string, timeframe: Timeframe): Candle {
   const timestamp = Date.now();
-  const basePrice = Math.random() * 1000 + 100;
+  const basePrice = getBasePriceForPair(pair);
   const open = basePrice + (Math.random() - 0.5) * 10;
   const close = open + (Math.random() - 0.5) * 15;
   const high = Math.max(open, close) + Math.random() * 5;
@@ -189,6 +193,24 @@ function generateMockCandle(pair: string, timeframe: Timeframe): Candle {
     close: parseFloat(close.toFixed(5)),
     volume: parseFloat(volume.toFixed(2)),
   };
+}
+
+// Get realistic base price for each pair
+function getBasePriceForPair(pair: string): number {
+  const pairPrices: Record<string, number> = {
+    R_10: 150 + Math.random() * 50,
+    R_25: 180 + Math.random() * 70,
+    R_50: 220 + Math.random() * 80,
+    R_75: 250 + Math.random() * 100,
+    R_100: 300 + Math.random() * 120,
+    EURUSD: 1.08 + (Math.random() - 0.5) * 0.05,
+    GBPUSD: 1.27 + (Math.random() - 0.5) * 0.05,
+    USDJPY: 149 + (Math.random() - 0.5) * 2,
+    AUDUSD: 0.68 + (Math.random() - 0.5) * 0.02,
+    XAUUSD: 2050 + (Math.random() - 0.5) * 50,
+  };
+
+  return pairPrices[pair] || 100 + Math.random() * 100;
 }
 
 server.listen(PORT, () => {
