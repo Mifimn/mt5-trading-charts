@@ -2,6 +2,7 @@ import express, { Express, Request, Response } from 'express';
 import { WebSocketServer } from 'ws';
 import http from 'http';
 import axios from 'axios';
+import WebSocket from 'ws';
 import { Candle, Timeframe, ChartMessage } from './types/index.js';
 
 const app: Express = express();
@@ -47,15 +48,18 @@ const SUPPORTED_PAIRS = [
 let derivWs: WebSocket | null = null;
 const derivSubscriptions = new Map<string, { req_id: number; pair: string; timeframe: Timeframe }>();
 let nextReqId = 1;
+let derivConnected = false;
 
 // Initialize Deriv WebSocket connection
 function initDerivConnection() {
   try {
+    console.log('🔗 Attempting to connect to Deriv API...');
     derivWs = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
 
     derivWs.onopen = () => {
+      derivConnected = true;
       console.log('✅ Connected to Deriv API');
-      // Authorize with app_id (or token if you have one)
+      // Authorize with app_id
       derivWs?.send(
         JSON.stringify({
           authorize: 'AQIC3xDTMSJySEQoK1KSwPFZSXvfJK_Mdu6yzGFnWQk2AoI',
@@ -84,16 +88,19 @@ function initDerivConnection() {
     };
 
     derivWs.onerror = (error) => {
-      console.error('Deriv WebSocket error:', error);
+      derivConnected = false;
+      console.error('❌ Deriv WebSocket error:', error);
     };
 
     derivWs.onclose = () => {
+      derivConnected = false;
       console.log('❌ Deriv WebSocket disconnected');
       // Attempt to reconnect after 5 seconds
       setTimeout(initDerivConnection, 5000);
     };
   } catch (error) {
-    console.error('Error initializing Deriv connection:', error);
+    derivConnected = false;
+    console.error('❌ Error initializing Deriv connection:', error);
     setTimeout(initDerivConnection, 5000);
   }
 }
@@ -179,18 +186,19 @@ app.get('/api/candles', async (req: Request, res: Response) => {
       return res.json({ pair, timeframe, candles, source: 'cache' });
     }
 
-    // Fetch from Deriv API
-    const candles = await fetchFromDerivAPI(pair as string, timeframe as Timeframe, parseInt(limit as string));
-
-    if (candles.length > 0) {
-      candleCache.set(cacheKey, { candles, timestamp: Date.now() });
-      return res.json({ pair, timeframe, candles, source: 'deriv' });
-    } else {
-      // Fallback to mock data if API fails
-      console.warn(`No real data for ${pair}, using mock data`);
-      const mockCandles = generateMockCandles(pair as string, timeframe as Timeframe, parseInt(limit as string));
-      return res.json({ pair, timeframe, candles: mockCandles, source: 'mock' });
+    // Try to fetch from Deriv API if connected
+    if (derivConnected) {
+      const candles = await fetchFromDerivAPI(pair as string, timeframe as Timeframe, parseInt(limit as string));
+      if (candles.length > 0) {
+        candleCache.set(cacheKey, { candles, timestamp: Date.now() });
+        return res.json({ pair, timeframe, candles, source: 'deriv' });
+      }
     }
+
+    // Fallback to mock data
+    console.warn(`Using mock data for ${pair} ${timeframe}`);
+    const mockCandles = generateMockCandles(pair as string, timeframe as Timeframe, parseInt(limit as string));
+    return res.json({ pair, timeframe, candles: mockCandles, source: 'mock' });
   } catch (error) {
     console.error('Error fetching candles:', error);
     res.status(500).json({ error: 'Failed to fetch candle data' });
@@ -201,7 +209,7 @@ app.get('/api/candles', async (req: Request, res: Response) => {
 async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
   return new Promise((resolve) => {
     if (!derivWs || derivWs.readyState !== 1) {
-      console.warn('Deriv WebSocket not connected, using mock data');
+      console.warn('⚠️ Deriv WebSocket not connected');
       resolve([]);
       return;
     }
@@ -225,22 +233,22 @@ async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: numb
 
     // Timeout after 10 seconds
     const timeout = setTimeout(() => {
-      console.warn(`Deriv API request ${req_id} timed out`);
+      console.warn(`⏱️ Deriv API request ${req_id} timed out`);
       resolve([]);
     }, 10000);
 
     // Store subscription temporarily to handle response
     derivSubscriptions.set(`temp_${req_id}`, { req_id, pair, timeframe });
 
-    // Listen for response
-    const originalOnMessage = derivWs!.onmessage;
-    derivWs!.onmessage = (event) => {
+    // Create a one-time message handler
+    const handleResponse = (event: any) => {
       try {
         const data = JSON.parse(event.data);
 
         if (data.req_id === req_id && data.candles) {
           clearTimeout(timeout);
           derivSubscriptions.delete(`temp_${req_id}`);
+          derivWs?.removeEventListener('message', handleResponse);
 
           const candles: Candle[] = data.candles.map((c: any) => ({
             timestamp: c.epoch * 1000,
@@ -258,7 +266,8 @@ async function fetchFromDerivAPI(pair: string, timeframe: Timeframe, limit: numb
       }
     };
 
-    derivWs!.send(JSON.stringify(request));
+    derivWs?.addEventListener('message', handleResponse);
+    derivWs?.send(JSON.stringify(request));
   });
 }
 
@@ -283,6 +292,15 @@ function mapToDeriVSymbol(symbol: string): string {
 // API endpoint to get supported pairs
 app.get('/api/pairs', (req: Request, res: Response) => {
   res.json(SUPPORTED_PAIRS);
+});
+
+// API endpoint for connection status
+app.get('/api/status', (req: Request, res: Response) => {
+  res.json({
+    derivConnected,
+    cacheSize: candleCache.size,
+    subscribedClients: wss.clients.size,
+  });
 });
 
 // WebSocket server setup
@@ -420,10 +438,11 @@ function getBasePriceForPair(pair: string): number {
 }
 
 // Initialize Deriv connection on startup
+console.log('🌍 Starting MT5 Trading Charts Server...');
 initDerivConnection();
 
 server.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
   console.log(`📊 WebSocket server ready at ws://localhost:${PORT}/ws`);
-  console.log(`🔗 Deriv API connection initializing...`);
+  console.log(`📈 API Status: http://localhost:${PORT}/api/status`);
 });
